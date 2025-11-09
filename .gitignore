@@ -4,3 +4,11 @@ proxies.txt
 __pycache__/
 *.pyc
 .DS_Store
+.vscode/
+.idea/
+logs/
+youtube_scraped_data.db
+youtube_scraped_data.db-shm
+youtube_scraped_data.db-wal
+output/
+
