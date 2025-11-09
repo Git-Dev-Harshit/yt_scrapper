@@ -44,9 +44,9 @@ API_KEY = os.getenv("YOUTUBE_API_KEY")
 TOPICS_FILE = "topics.txt"
 PROXIES_FILE = "proxies.txt"
 DB_FILE = "youtube_scraped_data.db"
-MAX_PER_TOPIC = 30
-WORKERS = 2
-RATE_LIMIT_SECONDS = 2  # limit requests
+MAX_PER_TOPIC = 1000000
+WORKERS = 4
+RATE_LIMIT_SECONDS = 3  # limit requests
 API_SERVICE_NAME = "youtube"
 API_VERSION = "v3"
 
@@ -97,7 +97,7 @@ def upsert_scraped(conn: sqlite3.Connection, rec: dict):
         data = (
             uri,
             now,
-            "YouTube API",
+            "3",
             label,
             content_json,
             len(content_json.encode("utf-8")),
