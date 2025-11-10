@@ -29,6 +29,7 @@ import logging
 import sqlite3
 import threading
 import concurrent.futures
+import random
 from typing import List, Optional, Dict
 from urllib.parse import urlparse, parse_qs
 from dateutil import parser as dateparser
@@ -43,11 +44,12 @@ from pytubefix.contrib.playlist import Playlist
 # ---------- Config ----------
 load_dotenv()
 
-TOPICS_FILE = "topics_2.txt"
-DB_FILE = "youtube_scraped_data_2.db"
-MAX_PER_TOPIC = 2
-WORKERS = 4
-RATE_LIMIT_SECONDS = 3
+TOPICS_FILE = "topics.txt"
+DB_FILE = "youtube_scraped_data.db"
+PROXIES_FILE = "proxies.txt"
+MAX_PER_TOPIC = 100000
+WORKERS = 6
+RATE_LIMIT_SECONDS = 2
 SOURCE_NAME = "3"
 
 # ---------- Logging ----------
@@ -74,6 +76,69 @@ CREATE TABLE IF NOT EXISTS scraped_data (
 """
 
 _db_lock = threading.Lock()
+
+
+def load_proxies(path: str) -> List[str]:
+    """Load proxies from file. Format: ip:port:username:password"""
+    if not os.path.exists(path):
+        log.warning(f"Proxies file not found: {path}. Running without proxies.")
+        return []
+    
+    proxies = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    # Parse format: ip:port:username:password
+                    parts = line.split(":")
+                    if len(parts) >= 4:
+                        ip, port, username, password = parts[0], parts[1], parts[2], parts[3]
+                        proxy_url = f"http://{username}:{password}@{ip}:{port}"
+                        proxies.append(proxy_url)
+        log.info(f"Loaded {len(proxies)} proxies from {path}")
+    except Exception as e:
+        log.error(f"Error loading proxies: {e}")
+    
+    return proxies
+
+
+class ProxyRotator:
+    """Manages rotating proxy selection"""
+    def __init__(self, proxies: List[str]):
+        self.proxies = proxies
+        self.current_index = 0
+        self.lock = threading.Lock()
+    
+    def get_next_proxy(self) -> Optional[Dict]:
+        """Get next proxy in rotation"""
+        if not self.proxies:
+            return None
+        
+        with self.lock:
+            proxy = self.proxies[self.current_index]
+            self.current_index = (self.current_index + 1) % len(self.proxies)
+        
+        return {
+            "http": proxy,
+            "https": proxy
+        }
+    
+    def get_random_proxy(self) -> Optional[Dict]:
+        """Get random proxy for diversity"""
+        if not self.proxies:
+            return None
+        
+        proxy = random.choice(self.proxies)
+        return {
+            "http": proxy,
+            "https": proxy
+        }
+
+
+# Load proxies at startup
+_proxies_list = load_proxies(PROXIES_FILE)
+_proxy_rotator = ProxyRotator(_proxies_list) if _proxies_list else None
 
 
 def open_db(path: str) -> sqlite3.Connection:
@@ -188,14 +253,24 @@ def get_channel_subscribers(channel_url: str) -> Optional[int]:
         return _channel_cache[channel_url]
 
     try:
-        ch = Channel(channel_url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        ch = Channel(channel_url, proxies=proxies) if proxies else Channel(channel_url)
         subs = extract_subscriber_count_from_html(ch.about_html)
         _channel_cache[channel_url] = subs
         return subs
     except Exception as e:
-        log.warning(f"[Channel] Failed to fetch subscribers for {channel_url}: {e}")
-        _channel_cache[channel_url] = None
-        return None
+        log.warning(f"[Channel] Failed to fetch subscribers for {channel_url} (proxy attempt): {e}")
+        # Retry without proxy
+        try:
+            ch = Channel(channel_url)
+            subs = extract_subscriber_count_from_html(ch.about_html)
+            _channel_cache[channel_url] = subs
+            return subs
+        except Exception as e2:
+            log.warning(f"[Channel] Failed to fetch subscribers for {channel_url} (fallback): {e2}")
+            _channel_cache[channel_url] = None
+            return None
 
 
 # ---------- Transcript ----------
@@ -203,10 +278,17 @@ def fetch_transcript(video_id: str) -> Optional[str]:
     """Fetch transcript (auto/manual) if available using pytubefix captions."""
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        yt = YouTube(url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        yt = YouTube(url, proxies=proxies) if proxies else YouTube(url)
     except Exception as e:
-        log.warning(f"[Transcript] Failed to load video {video_id}: {e}")
-        return None
+        log.warning(f"[Transcript] Failed to load video {video_id} (attempt 1): {e}")
+        # Retry without proxy as fallback
+        try:
+            yt = YouTube(url)
+        except Exception as e2:
+            log.warning(f"[Transcript] Failed to load video {video_id} (attempt 2): {e2}")
+            return None
 
     try:
         captions = yt.captions
@@ -268,10 +350,17 @@ def build_video_record(yt: YouTube, topic: str) -> dict:
 
 def handle_video(item, topic: str, conn: sqlite3.Connection):
     try:
-        yt = YouTube(item.watch_url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        yt = YouTube(item.watch_url, proxies=proxies) if proxies else YouTube(item.watch_url)
     except Exception as e:
-        log.warning(f"[{topic}] Skipping video load error: {e}")
-        return False
+        log.warning(f"[{topic}] Skipping video load error (proxy attempt): {e}")
+        # Retry without proxy
+        try:
+            yt = YouTube(item.watch_url)
+        except Exception as e2:
+            log.warning(f"[{topic}] Skipping video load error (fallback): {e2}")
+            return False
 
     upload_date = yt.publish_date.isoformat() if yt.publish_date else None
     if not upload_date or not within_last_n_days(upload_date, 30):
@@ -289,10 +378,17 @@ def handle_video(item, topic: str, conn: sqlite3.Connection):
 
 def handle_short(item, topic: str, conn: sqlite3.Connection):
     try:
-        yt = YouTube(item.watch_url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        yt = YouTube(item.watch_url, proxies=proxies) if proxies else YouTube(item.watch_url)
     except Exception as e:
-        log.warning(f"[{topic}] Short fetch failed: {e}")
-        return False
+        log.warning(f"[{topic}] Short fetch failed (proxy attempt): {e}")
+        # Retry without proxy
+        try:
+            yt = YouTube(item.watch_url)
+        except Exception as e2:
+            log.warning(f"[{topic}] Short fetch failed (fallback): {e2}")
+            return False
 
     time.sleep(RATE_LIMIT_SECONDS)
 
@@ -317,10 +413,17 @@ def handle_short(item, topic: str, conn: sqlite3.Connection):
 
 def handle_channel(item, topic: str, conn: sqlite3.Connection):
     try:
-        ch = Channel(item.channel_url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        ch = Channel(item.channel_url, proxies=proxies) if proxies else Channel(item.channel_url)
     except Exception as e:
-        log.warning(f"[{topic}] Channel scrape failed: {e}")
-        return False
+        log.warning(f"[{topic}] Channel scrape failed (proxy attempt): {e}")
+        # Retry without proxy
+        try:
+            ch = Channel(item.channel_url)
+        except Exception as e2:
+            log.warning(f"[{topic}] Channel scrape failed (fallback): {e2}")
+            return False
 
     subs = extract_subscriber_count_from_html(ch.about_html)
     record = {
@@ -339,10 +442,17 @@ def handle_channel(item, topic: str, conn: sqlite3.Connection):
 
 def handle_playlist(item, topic: str, conn: sqlite3.Connection):
     try:
-        pl = Playlist(item.playlist_url)
+        # Use rotating proxy
+        proxies = _proxy_rotator.get_next_proxy() if _proxy_rotator else None
+        pl = Playlist(item.playlist_url, proxies=proxies) if proxies else Playlist(item.playlist_url)
     except Exception as e:
-        log.warning(f"[{topic}] Playlist scrape failed: {e}")
-        return False
+        log.warning(f"[{topic}] Playlist scrape failed (proxy attempt): {e}")
+        # Retry without proxy
+        try:
+            pl = Playlist(item.playlist_url)
+        except Exception as e2:
+            log.warning(f"[{topic}] Playlist scrape failed (fallback): {e2}")
+            return False
 
     subs = None
     if hasattr(pl, "owner_url"):
